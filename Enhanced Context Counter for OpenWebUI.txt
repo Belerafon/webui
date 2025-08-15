@@ -3844,6 +3844,28 @@ class Filter:
                     input_tokens += msg_tokens
                 elif role == "assistant":
                     output_tokens += msg_tokens
+            elif isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type", "")
+                    # Count textual parts, including file contents
+                    if part_type in ["text", "input_text"] or "text" in part:
+                        part_text = part.get("text", "") or part.get("content", "")
+                        text_tokens += self.count_tokens(part_text, model_name)
+                    elif part_type in ["image", "image_url", "input_image"]:
+                        override = self.valves.model_image_token_overrides.get(model_name)
+                        est_tokens = (
+                            override if override else self.valves.default_image_tokens
+                        )
+                        image_tokens += est_tokens
+                msg_tokens = text_tokens + image_tokens
+                total_text_tokens += text_tokens
+                total_image_tokens += image_tokens
+                if role == "user":
+                    input_tokens += msg_tokens
+                elif role == "assistant":
+                    output_tokens += msg_tokens
 
             # Store token count for trimming hint analysis
             message_token_counts.append(
@@ -3852,6 +3874,29 @@ class Filter:
 
             # Calculate total tokens
             total_tokens = input_tokens + output_tokens
+
+        # Include tokens from standalone file attachments if present
+        attachments = (
+            body.get("files", [])
+            or body.get("attachments", [])
+            or body.get("documents", [])
+        )
+        for file in attachments:
+            file_content = ""
+            if isinstance(file, dict):
+                file_content = file.get("content") or file.get("text") or ""
+            if file_content:
+                file_tokens = self.count_tokens(file_content, model_name)
+                input_tokens += file_tokens
+                total_text_tokens += file_tokens
+                message_token_counts.append(
+                    {
+                        "role": "file",
+                        "tokens": file_tokens,
+                        "index": f"file-{len(message_token_counts)}",
+                    }
+                )
+        total_tokens = input_tokens + output_tokens
 
         # Update session stats
         self.session_stats["total_tokens"] = total_tokens
