@@ -3876,6 +3876,64 @@ class Filter:
             total_tokens = input_tokens + output_tokens
 
         # Include tokens from standalone file attachments if present
+        # --- DEBUG: attachments metadata start ---
+        try:
+            logger.debug("Request body keys: %s", list(body.keys()))
+            logger.debug("Request body size: %d bytes", len(json.dumps(body)))
+            logger.debug(
+                "Attachment counts - files: %d, attachments: %d, documents: %d",
+                len(body.get("files", [])),
+                len(body.get("attachments", [])),
+                len(body.get("documents", [])),
+            )
+            debug_details = []
+            # Top-level attachments
+            for field_name in ["files", "attachments", "documents"]:
+                for idx, f in enumerate(body.get(field_name, [])):
+                    if isinstance(f, dict):
+                        size = len((f.get("content") or f.get("text") or "").encode("utf-8"))
+                        logger.debug(
+                            "[%s][%s] keys=%s size=%d",
+                            field_name,
+                            idx,
+                            list(f.keys()),
+                            size,
+                        )
+                        debug_details.append(f"{field_name}[{idx}]:{size}")
+            # Message-level attachments
+            message_debug = []
+            for msg_idx, msg in enumerate(body.get("messages", [])):
+                if isinstance(msg, dict):
+                    logger.debug("Message[%d] keys=%s", msg_idx, list(msg.keys()))
+                    for field_name in ["files", "attachments", "documents"]:
+                        for idx, f in enumerate(msg.get(field_name, [])):
+                            if isinstance(f, dict):
+                                size = len((f.get("content") or f.get("text") or "").encode("utf-8"))
+                                logger.debug(
+                                    "Message[%d].%s[%d] keys=%s size=%d",
+                                    msg_idx,
+                                    field_name,
+                                    idx,
+                                    list(f.keys()),
+                                    size,
+                                )
+                                message_debug.append(
+                                    f"msg{msg_idx}.{field_name}[{idx}]:{size}"
+                                )
+            status_parts = []
+            if debug_details:
+                status_parts.append("Top:" + ",".join(debug_details))
+            if message_debug:
+                status_parts.append("Msgs:" + ",".join(message_debug))
+            if self.valves.show_status and status_parts:
+                await self._emit_status(
+                    __event_emitter__,
+                    f"[DEBUG] Attachments: {' | '.join(status_parts)}",
+                    True,
+                )
+        except Exception as e:
+            logger.error(f"Attachment debug failed: {e}")
+        # --- DEBUG: attachments metadata end ---
         attachments = (
             body.get("files", [])
             or body.get("attachments", [])
@@ -4279,5 +4337,3 @@ class Filter:
             logger.debug("Exiting outlet method (except block).")  # DEBUG
             return body
 
-
-на предложи что менять чтобы учитывался и файл вложения тоже
