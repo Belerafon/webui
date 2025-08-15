@@ -3876,6 +3876,37 @@ class Filter:
             total_tokens = input_tokens + output_tokens
 
         # Include tokens from standalone file attachments if present
+        # --- DEBUG: attachments metadata start ---
+        try:
+            logger.debug("Request body keys: %s", list(body.keys()))
+            logger.debug(
+                "Attachment counts - files: %d, attachments: %d, documents: %d",
+                len(body.get("files", [])),
+                len(body.get("attachments", [])),
+                len(body.get("documents", [])),
+            )
+            debug_details = []
+            for field_name in ["files", "attachments", "documents"]:
+                for idx, f in enumerate(body.get(field_name, [])):
+                    if isinstance(f, dict):
+                        size = len((f.get("content") or f.get("text") or "").encode("utf-8"))
+                        logger.debug(
+                            "[%s][%s] keys=%s size=%d",
+                            field_name,
+                            idx,
+                            list(f.keys()),
+                            size,
+                        )
+                        debug_details.append(f"{field_name}[{idx}]:{size}")
+            if self.valves.show_status and debug_details:
+                await self._emit_status(
+                    __event_emitter__,
+                    f"[DEBUG] Attachments: {' | '.join(debug_details)}",
+                    True,
+                )
+        except Exception as e:
+            logger.error(f"Attachment debug failed: {e}")
+        # --- DEBUG: attachments metadata end ---
         attachments = (
             body.get("files", [])
             or body.get("attachments", [])
@@ -4280,4 +4311,3 @@ class Filter:
             return body
 
 
-на предложи что менять чтобы учитывался и файл вложения тоже
