@@ -5,7 +5,7 @@
 // ChatGPT Configuration
 #define USER_KEY "sk-proj-xxx-xxxxxxxxxxxxxxxxxxxxxxx_xxx"
 #define USER_MODEL "gpt-4o"
-#define USER_ASSISTANT "You are an assistant, answer with very short messages."
+#define USER_ASSISTANT "You are an assistant. Respond in Russian using plain text only, without wrapping the output in markdown code fences or language tags. Keep messages very short."
 
 #define BUF_SIZE (1024)
 size_t hiddenWindow = 0;
