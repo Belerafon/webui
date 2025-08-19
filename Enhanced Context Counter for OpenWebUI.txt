@@ -1283,6 +1283,12 @@ class Filter:
             "message_generation_time": 0.0,
             "prev_total_tokens": 0,
         }
+        # Pre-request token accounting
+        self.inlet_input_tokens = 0
+        self.inlet_total_text_tokens = 0
+        self.inlet_total_image_tokens = 0
+        self.inlet_message_token_counts = []
+        self.inlet_message_count = 0
         # self.using_dynamic_pricing flag is set during data loading
 
         # Load initial calibration status
@@ -2572,6 +2578,57 @@ class Filter:
             # Non-critical operation - log but don't crash
             logger.error(f"Error pruning token cache: {e}")
 
+    def _count_message_tokens(self, message: dict, model_name: str) -> Tuple[int, int, int]:
+        """Return (total, text, image) token counts for a message."""
+        content = message.get("content", "")
+        msg_tokens = 0
+        text_tokens = 0
+        image_tokens = 0
+
+        if isinstance(content, str):
+            images = []
+            images += re.findall(r"!\[.*?\]\((.*?)\)", content)
+            if "data:image/" in content:
+                images += re.findall(r"(data:image/[^\"'\s]+)", content)
+            images += re.findall(
+                r"(https?://[^\s)]+(?:\.png|\.jpg|\.jpeg|\.gif|\.webp|\.bmp|\.tiff))",
+                content,
+                re.IGNORECASE,
+            )
+
+            for _ in images:
+                override = self.valves.model_image_token_overrides.get(model_name)
+                est = override if override else self.valves.default_image_tokens
+                image_tokens += est
+
+            text_tokens = self.count_tokens(content, model_name)
+            msg_tokens = text_tokens + image_tokens
+
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type", "")
+                if part_type in ("output_text", "input_text", "text"):
+                    part_text = part.get("text", "")
+                    part_tokens = self.count_tokens(part_text, model_name)
+                    text_tokens += part_tokens
+                elif part_type in ("input_image", "image", "image_url"):
+                    override = self.valves.model_image_token_overrides.get(model_name)
+                    est = override if override else self.valves.default_image_tokens
+                    image_tokens += est
+
+            msg_tokens = text_tokens + image_tokens
+
+        return msg_tokens, text_tokens, image_tokens
+
+    def _count_attachment_tokens(self, file: dict, model_name: str) -> int:
+        """Count tokens for an attachment's textual content."""
+        content = ""
+        if isinstance(file, dict):
+            content = file.get("content") or file.get("text") or ""
+        return self.count_tokens(content, model_name) if content else 0
+
     def _is_experimental_model(self, model_name: str) -> bool:
         """Determine if a model is experimental or newly released.
 
@@ -3599,6 +3656,45 @@ class Filter:
             except Exception as e:
                 logger.error(f"Error during inlet cost prediction: {e}")
         # --- End Inlet Cost Prediction ---
+        try:
+            model_name = body.get("model", "default")
+            messages = body.get("messages", [])
+            self.inlet_input_tokens = 0
+            self.inlet_total_text_tokens = 0
+            self.inlet_total_image_tokens = 0
+            self.inlet_message_token_counts = []
+            self.inlet_message_count = len(messages)
+
+            for idx, message in enumerate(messages):
+                msg_tokens, text_tokens, image_tokens = self._count_message_tokens(
+                    message, model_name
+                )
+                self.inlet_input_tokens += msg_tokens
+                self.inlet_total_text_tokens += text_tokens
+                self.inlet_total_image_tokens += image_tokens
+                self.inlet_message_token_counts.append(
+                    {"role": message.get("role", ""), "tokens": msg_tokens, "index": idx}
+                )
+
+            attachments = (
+                body.get("files", [])
+                or body.get("attachments", [])
+                or body.get("documents", [])
+            )
+            for file in attachments:
+                file_tokens = self._count_attachment_tokens(file, model_name)
+                if file_tokens:
+                    self.inlet_input_tokens += file_tokens
+                    self.inlet_total_text_tokens += file_tokens
+                    self.inlet_message_token_counts.append(
+                        {
+                            "role": "file",
+                            "tokens": file_tokens,
+                            "index": len(self.inlet_message_token_counts),
+                        }
+                    )
+        except Exception as e:
+            logger.error(f"Inlet token counting failed: {e}")
 
         # Return the unmodified body (this filter doesn't modify inputs)
         return body
@@ -3794,139 +3890,32 @@ class Filter:
         # Extract the last assistant message
         get_last_assistant_message(messages)
 
-        # Count tokens in all messages
-        input_tokens = 0
+        # Start with counts from inlet
+        input_tokens = getattr(self, "inlet_input_tokens", 0)
         output_tokens = 0
-        total_text_tokens = 0
-        total_image_tokens = 0
+        total_text_tokens = getattr(self, "inlet_total_text_tokens", 0)
+        total_image_tokens = getattr(self, "inlet_total_image_tokens", 0)
+        message_token_counts = list(getattr(self, "inlet_message_token_counts", []))
 
-        # Store token counts per message for trimming hint
-        message_token_counts = []
-
-        for idx, message in enumerate(messages):
+        start_index = getattr(self, "inlet_message_count", 0)
+        for idx in range(start_index, len(messages)):
+            message = messages[idx]
             role = message.get("role", "")
-            content = message.get("content", "")
-            msg_tokens = 0
-            image_tokens = 0
-            text_tokens = 0
+            msg_tokens, text_tokens, image_tokens = self._count_message_tokens(
+                message, model_name
+            )
 
-            if isinstance(content, str):
-                # --- Image token estimation ---
-                images = []
-                images += re.findall(r"!\[.*?\]\((.*?)\)", content)
-                if "data:image/" in content:
-                    images += re.findall(r'(data:image/[^"\')\s]+)', content)
-                images += re.findall(
-                    r"(https?://[^\s)]+(?:\.png|\.jpg|\.jpeg|\.gif|\.webp|\.bmp|\.tiff))",
-                    content,
-                    re.IGNORECASE,
-                )
+            if role == "assistant":
+                output_tokens += msg_tokens
+            else:
+                input_tokens += msg_tokens
 
-                for img in images:
-                    override = self.valves.model_image_token_overrides.get(model_name)
-                    if override:
-                        est_tokens = override
-                    else:
-                        est_tokens = self.valves.default_image_tokens
-                    image_tokens += est_tokens
-
-                # Count text tokens only
-                text_tokens = self.count_tokens(content, model_name)
-
-                # Add image tokens to message tokens
-                msg_tokens = text_tokens + image_tokens
-
-                # Sum separate totals
-                total_text_tokens += text_tokens
-                total_image_tokens += image_tokens
-
-                if role == "user":
-                    input_tokens += msg_tokens
-                elif role == "assistant":
-                    output_tokens += msg_tokens
-            elif isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    part_type = part.get("type", "")
-                    # Count textual parts, including file contents
-                    if part_type in ["text", "input_text"] or "text" in part:
-                        part_text = part.get("text", "") or part.get("content", "")
-                        text_tokens += self.count_tokens(part_text, model_name)
-                    elif part_type in ["image", "image_url", "input_image"]:
-                        override = self.valves.model_image_token_overrides.get(model_name)
-                        est_tokens = (
-                            override if override else self.valves.default_image_tokens
-                        )
-                        image_tokens += est_tokens
-                msg_tokens = text_tokens + image_tokens
-                total_text_tokens += text_tokens
-                total_image_tokens += image_tokens
-                if role == "user":
-                    input_tokens += msg_tokens
-                elif role == "assistant":
-                    output_tokens += msg_tokens
-
-            # Store token count for trimming hint analysis
+            total_text_tokens += text_tokens
+            total_image_tokens += image_tokens
             message_token_counts.append(
                 {"role": role, "tokens": msg_tokens, "index": idx}
             )
 
-            # Calculate total tokens
-            total_tokens = input_tokens + output_tokens
-
-        # Include tokens from standalone file attachments if present
-        # --- DEBUG: attachments metadata start ---
-        try:
-            logger.debug("Request body keys: %s", list(body.keys()))
-            logger.debug(
-                "Attachment counts - files: %d, attachments: %d, documents: %d",
-                len(body.get("files", [])),
-                len(body.get("attachments", [])),
-                len(body.get("documents", [])),
-            )
-            debug_details = []
-            for field_name in ["files", "attachments", "documents"]:
-                for idx, f in enumerate(body.get(field_name, [])):
-                    if isinstance(f, dict):
-                        size = len((f.get("content") or f.get("text") or "").encode("utf-8"))
-                        logger.debug(
-                            "[%s][%s] keys=%s size=%d",
-                            field_name,
-                            idx,
-                            list(f.keys()),
-                            size,
-                        )
-                        debug_details.append(f"{field_name}[{idx}]:{size}")
-            if self.valves.show_status and debug_details:
-                await self._emit_status(
-                    __event_emitter__,
-                    f"[DEBUG] Attachments: {' | '.join(debug_details)}",
-                    True,
-                )
-        except Exception as e:
-            logger.error(f"Attachment debug failed: {e}")
-        # --- DEBUG: attachments metadata end ---
-        attachments = (
-            body.get("files", [])
-            or body.get("attachments", [])
-            or body.get("documents", [])
-        )
-        for file in attachments:
-            file_content = ""
-            if isinstance(file, dict):
-                file_content = file.get("content") or file.get("text") or ""
-            if file_content:
-                file_tokens = self.count_tokens(file_content, model_name)
-                input_tokens += file_tokens
-                total_text_tokens += file_tokens
-                message_token_counts.append(
-                    {
-                        "role": "file",
-                        "tokens": file_tokens,
-                        "index": f"file-{len(message_token_counts)}",
-                    }
-                )
         total_tokens = input_tokens + output_tokens
 
         # Update session stats
