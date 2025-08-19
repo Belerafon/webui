@@ -3592,7 +3592,12 @@ class Filter:
             logger.error(f"Error emitting status: {str(e)}")
 
     # INLET METHOD (Pre-processing)
-    def inlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    def inlet(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
+    ) -> dict:
         """Process requests before they reach the LLM.
 
         This is the entry point for the Filter function. It initializes timing,
@@ -3695,6 +3700,49 @@ class Filter:
                     )
         except Exception as e:
             logger.error(f"Inlet token counting failed: {e}")
+
+        # Emit preliminary status showing prompt tokens before generation
+        if __event_emitter__ and self.valves.show_status:
+            try:
+                context_size = self.get_context_size(model_name, __user__)
+                total_tokens = self.inlet_input_tokens
+                context_percentage = (
+                    (total_tokens / context_size) * 100 if context_size > 0 else 0
+                )
+                progress_bar = self._format_progress_bar(context_percentage)
+                status_level = "normal"
+                status_prefix = ""
+                if context_percentage >= self.valves.critical_at_percentage:
+                    status_level = "critical"
+                    status_prefix = f"{WARNING_EMOJI} CRITICAL: "
+                elif context_percentage >= self.valves.warn_at_percentage:
+                    status_level = "warning"
+                    status_prefix = f"{WARNING_EMOJI} WARNING: "
+                formatted_cost = self._format_cost(
+                    self._calculate_cost(total_tokens, 0, model_name, __user__),
+                    context_size,
+                )
+                status_message = self._generate_status_message(
+                    status_prefix=status_prefix,
+                    total_tokens=total_tokens,
+                    context_size=context_size,
+                    context_percentage=context_percentage,
+                    progress_bar=progress_bar,
+                    input_tokens=total_tokens,
+                    output_tokens=0,
+                    cost=formatted_cost,
+                    model_name=model_name,
+                    status_level=status_level,
+                    text_tokens=self.inlet_total_text_tokens,
+                    image_tokens=self.inlet_total_image_tokens,
+                    calibration_status=self.calibration_status_display,
+                )
+                loop = asyncio.get_event_loop()
+                loop.create_task(
+                    self._emit_status(__event_emitter__, status_message, False)
+                )
+            except Exception as emit_err:
+                logger.error(f"Error emitting inlet status: {emit_err}")
 
         # Return the unmodified body (this filter doesn't modify inputs)
         return body
