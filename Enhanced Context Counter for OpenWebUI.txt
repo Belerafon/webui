@@ -1296,6 +1296,8 @@ class Filter:
 
         # Initialize request counter
         self.request_counter = 0
+        self.logged_request_ids = set()
+        self.pricing_warning_logged = set()
 
         # Initial parsing attempt during initialization
         self._parse_and_apply_plaintext_models()
@@ -2627,7 +2629,13 @@ class Filter:
         content = ""
         if isinstance(file, dict):
             content = file.get("content") or file.get("text") or ""
-        return self.count_tokens(content, model_name) if content else 0
+        tokens = self.count_tokens(content, model_name) if content else 0
+        if tokens:
+            name = file.get("name") or file.get("filename") or "unknown"
+            logger.debug(
+                f"Counted {tokens} tokens for attachment '{name}' (len={len(content)})"
+            )
+        return tokens
 
     def _is_experimental_model(self, model_name: str) -> bool:
         """Determine if a model is experimental or newly released.
@@ -3524,9 +3532,15 @@ class Filter:
             # If pricing is missing or zero for a non-free model, log a warning and use generic fallback
             # DEBUG: Include current pricing keys and original model name in the warning
             current_pricing_keys = list(self.model_pricing.keys())
-            logger.warning(
-                f"Pricing not found or zero via {source} for resolved_model_name='{resolved_model_name}' (original input='{model_name}'). Using generic fallback (GPT-3.5). Current pricing keys: {current_pricing_keys}"
-            )
+            if resolved_model_name not in self.pricing_warning_logged:
+                logger.warning(
+                    f"Pricing not found or zero via {source} for resolved_model_name='{resolved_model_name}' (original input='{model_name}'). Using generic fallback (GPT-3.5). Current pricing keys: {current_pricing_keys}"
+                )
+                self.pricing_warning_logged.add(resolved_model_name)
+            else:
+                logger.debug(
+                    f"Pricing not found for '{resolved_model_name}' (suppressed repeat)"
+                )
             # The hardcoded_pricing dictionary is local to __init__ and merged into self.model_pricing.
             # We don't need to access it separately here. The check above handles if the merged value is valid.
             # If it wasn't found or was invalid, we use the generic fallback.
@@ -3689,6 +3703,10 @@ class Filter:
             for file in attachments:
                 file_tokens = self._count_attachment_tokens(file, model_name)
                 if file_tokens:
+                    name = file.get("name") or file.get("filename") or "unknown"
+                    logger.debug(
+                        f"Adding {file_tokens} tokens from attachment '{name}' to inlet totals"
+                    )
                     self.inlet_input_tokens += file_tokens
                     self.inlet_total_text_tokens += file_tokens
                     self.inlet_message_token_counts.append(
@@ -3698,6 +3716,9 @@ class Filter:
                             "index": len(self.inlet_message_token_counts),
                         }
                     )
+            logger.debug(
+                f"Total inlet tokens after attachments: {self.inlet_input_tokens}"
+            )
         except Exception as e:
             logger.error(f"Inlet token counting failed: {e}")
 
@@ -4219,9 +4240,15 @@ class Filter:
                     total_cost,
                 )
 
-            logger.info(
-                f"Request #{self.request_counter} completed: {total_tokens} tokens ({context_percentage:.1f}%), ${total_cost:.6f}"
-            )
+            if self.current_request_id not in self.logged_request_ids:
+                logger.info(
+                    f"Request #{self.request_counter} completed: {total_tokens} tokens ({context_percentage:.1f}%), ${total_cost:.6f}"
+                )
+                self.logged_request_ids.add(self.current_request_id)
+            else:
+                logger.debug(
+                    f"Skipping duplicate completion log for {self.current_request_id}"
+                )
             # Emit final status update to UI
             if self.valves.show_status:
                 await self._emit_status(__event_emitter__, status_message, True)
